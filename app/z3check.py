@@ -65,17 +65,22 @@ class Z3Outcome:
 
 
 class SymbolicDB:
-    """stations / readings 各 MAX_ROWS 行的符号化数据库状态及完整性约束。"""
+    """stations / readings 各 MAX_ROWS 行的符号化数据库状态及完整性约束。
 
-    def __init__(self) -> None:
+    prefix 用于在同一次求解中符号化多个快照（如样本对的两侧），避免变量重名。
+    """
+
+    def __init__(self, prefix: str = "") -> None:
         self.present: dict[str, list] = {}
         self.cells: dict[str, dict[str, list[Cell]]] = {}
         for tname, cols in SCHEMA.items():
-            self.present[tname] = [Bool(f"{tname}_p{i}") for i in range(MAX_ROWS)]
+            self.present[tname] = [
+                Bool(f"{prefix}{tname}_p{i}") for i in range(MAX_ROWS)
+            ]
             tcells: dict[str, list[Cell]] = {}
             for col in cols:
-                nulls = [Bool(f"{tname}_{col}_n{i}") for i in range(MAX_ROWS)]
-                vals = [Int(f"{tname}_{col}_v{i}") for i in range(MAX_ROWS)]
+                nulls = [Bool(f"{prefix}{tname}_{col}_n{i}") for i in range(MAX_ROWS)]
+                vals = [Int(f"{prefix}{tname}_{col}_v{i}") for i in range(MAX_ROWS)]
                 tcells[col] = list(zip(nulls, vals))
             self.cells[tname] = tcells
 

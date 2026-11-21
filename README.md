@@ -10,6 +10,15 @@
 - 界内无反例报 `EQUIVALENT`（仅三行界内结论，不构成更大表上的证明）；
 - 求解或复现失败报 `UNKNOWN`。
 
+另提供**测试样本 API**（`POST /samples`）：针对单条
+`stations LEFT JOIN readings ON id = station_id` 的质控 SELECT，按书写顺序为
+WHERE 中每个检查 `readings.value` 的比较 / 判空条件寻找一对快照——两份快照
+仅在某一条**已匹配读数**的 `value` 上不同，且在该连接行上**目标条件的三值
+结果改变、其余原子条件不变、仅一侧通过 WHERE**。样本对同样在隔离
+PostgreSQL 中复核（逐连接行比对条件真值、确认结果多重集不同）后，以两份
+可装载 SQL 返回；界内找不到样本时标记 `UNCOVERABLE`，求解或复核无法确认时
+标记 `UNKNOWN`。
+
 ## 固定模式
 
 ```sql
@@ -84,12 +93,67 @@ curl -s -X POST http://localhost:8000/check \
        "query_b":"SELECT id FROM stations"}'
 ```
 
+### `POST /samples`
+
+```json
+{
+  "query": "SELECT s.id, r.value FROM stations s LEFT JOIN readings r ON s.id = r.station_id WHERE r.value > 5 OR r.value IS NULL",
+  "solver_timeout_ms": 10000
+}
+```
+
+响应（节选）：
+
+```json
+{
+  "bound_rows": 3,
+  "message": "共 2 个 readings.value 条件：1 个已覆盖，1 个界内无法单独覆盖，0 个未知。",
+  "conditions": [
+    {
+      "index": 0,
+      "condition": "(readings.value > 5)",
+      "status": "COVERED",
+      "message": "已找到仅改变该条件的快照对，并在隔离 PostgreSQL 中复核通过。",
+      "pair": {
+        "setup_sql_a": "DROP TABLE IF EXISTS readings;\n...",
+        "setup_sql_b": "DROP TABLE IF EXISTS readings;\n...",
+        "changed_reading": {"station_id": 0, "value_a": 0, "value_b": 6},
+        "target_truth_a": "FALSE", "target_truth_b": "TRUE",
+        "where_truth_a": "FALSE", "where_truth_b": "TRUE",
+        "query_result_a": [[-2, null], [-1, null]],
+        "query_result_b": [[0, 6], [-2, null], [-1, null]]
+      }
+    },
+    {
+      "index": 1,
+      "condition": "(readings.value IS NULL)",
+      "status": "UNCOVERABLE",
+      "message": "每表 0~3 行界内不存在仅改变该条件、其余原子条件不变的快照对，该条件无法单独覆盖。",
+      "pair": null
+    }
+  ]
+}
+```
+
+- 仅接受 `stations LEFT JOIN readings ON stations.id = readings.station_id`
+  （表可加别名、ON 两侧可交换、`LEFT OUTER JOIN` 亦可），其余形态 400；
+- `conditions` 按书写顺序列出 WHERE 中每个检查 `readings.value` 的比较 /
+  判空条件（`index` 为全部原子条件中的书写序号）；没有此类条件时返回空表；
+- `status=COVERED`：`pair.setup_sql_a` / `setup_sql_b` 可直接装载到任意
+  scratch 库，两份快照仅 `changed_reading` 的 `value` 不同；`target_truth_*`
+  / `where_truth_*` 为隔离 PostgreSQL 在该连接行上复核得到的三值结果，
+  `query_result_*` 为两侧实际查询结果（多重集必然不同）；
+- `status=UNCOVERABLE`：界内不存在满足条件的快照对（仅三行界内结论）；
+- `status=UNKNOWN`：z3 超时 / 无法判定，或 PostgreSQL 复核失败、未确认
+  （`message` 说明原因）；
+- 每个目标条件独立求解一次，超时上限按 `solver_timeout_ms` 逐个计算。
+
 ### 其他端点
 
 - `GET /`：服务信息；
 - `GET /health`：健康检查（含数据库连通性）；
 - `GET /docs`：Swagger 交互文档，内置等价 / 不等价（NULL 语义、LEFT JOIN
-  重复行）等命名示例，可直接 "Try it out"。
+  重复行）与样本对（可覆盖 / 无法单独覆盖）等命名示例，可直接 "Try it out"。
 
 ## 判定原理
 
@@ -101,6 +165,19 @@ curl -s -X POST http://localhost:8000/check \
 3. **PostgreSQL 复现**（`app/verifier.py`）：候选反例在独立临时 schema 中
    建表、装载、实际执行两条查询并比较多重集；确认差异才报
    `NOT_EQUIVALENT`，否则报 `UNKNOWN`。
+
+样本对（`/samples`）采用同一套设施：
+
+1. **原子条件枚举**（`app/conditions.py`）：中序遍历 WHERE 得到书写顺序的
+   原子条件（比较 / 判空），筛出检查 `readings.value` 的目标条件。
+2. **z3 快照对求解**（`app/z3sample.py`）：同时符号化两个数据库快照，
+   约束两快照仅某一条已匹配读数（`station_id` 非 NULL）的 `value` 不同；
+   在该读数参与的唯一连接行上，要求目标条件三值结果改变、其余原子条件
+   三值结果不变、WHERE 恰好一侧为 TRUE。`UNSAT` 即界内无法单独覆盖。
+3. **PostgreSQL 复核**（`app/verifier.py`）：两侧快照在同一事务的临时
+   schema 中先后装载，诊断查询逐连接行输出全部原子条件与整体 WHERE 的
+   三值结果；确认两侧诊断行仅相差被改读数一行、该行上各项真值满足要求，
+   且被测查询结果多重集不同，才报 `COVERED`，否则报 `UNKNOWN`。
 
 ## 配置
 
@@ -115,12 +192,14 @@ curl -s -X POST http://localhost:8000/check \
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 pytest tests/                       # 单元测试（解析器 / z3 / API 打桩）
-DATABASE_URL=postgresql://... pytest tests/test_e2e.py   # 端到端（需真实 PG）
+DATABASE_URL=postgresql://... pytest tests/test_e2e.py tests/test_e2e_samples.py   # 端到端（需真实 PG）
 ```
 
 ## 已知边界
 
-- 等价结论仅限每表 ≤3 行（有界模型检验，非全量证明）；
+- 等价结论与样本搜索均仅限每表 ≤3 行（有界模型检验，非全量证明）；
 - 仅支持上述 SQL 子集；两查询投影列数不一致返回 400；
-- 复现使用单事务 + 临时 schema，不在库中留存对象；数据库不可达时
-  不等价判定降级为 `UNKNOWN`（等价判定不依赖数据库）。
+- `/samples` 仅接受固定的左连接形态，且只分析 `readings.value` 上的
+  比较 / 判空条件；`UNCOVERABLE` 同样是三行界内结论；
+- 复现与复核使用单事务 + 临时 schema，不在库中留存对象；数据库不可达时
+  不等价判定与样本覆盖判定均降级为 `UNKNOWN`（等价判定不依赖数据库）。
